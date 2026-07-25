@@ -1,0 +1,17 @@
+[Unit]
+Description=late chat-bridge (FastAPI + WebSocket)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/late.kodingvibes.com/services/chat-bridge
+EnvironmentFile=/root/.env.backup
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/chat-bridge/venv/bin/uvicorn app:app --host 0.0.0.0 --port 9100
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
