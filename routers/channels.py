@@ -3,7 +3,7 @@ import httpx
 from core.auth import get_session_user, get_channel_role, is_global_admin
 from core.config import LATE_AUTH_SECRET, LATE_AUTH_URL
 from schemas.chat import CreateChannelRequest, UpdateChannelRequest, InviteRequest
-from repositories.channels import list_channels, get_channel, create_channel, update_channel
+from repositories.channels import list_channels, get_channel, create_channel, update_channel, delete_channel
 from repositories.receipts import mark_read
 from services.notifications import send_to_kv
 from services.voice_rooms import voice_rooms
@@ -79,9 +79,19 @@ async def delete_channel_route(channel_id: int, session: dict = Depends(get_sess
         role = get_channel_role(channel_id, session["user_id"])
         if role != "admin":
             raise HTTPException(403, "Only admins can delete a channel")
-    with db() as conn:
-        conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
-    return {"ok": True}
+    removed_files = delete_channel(channel_id)
+    # ponytail: notify every connected client so the row
+    # disappears from their channel list without a manual
+    # refresh. We can't broadcast_to_channel_members because the
+    # channel_members rows are already gone; the frontend
+    # listens for "channel_deleted" and removes the channel from
+    # its local Map. Sender is included so the initiating tab
+    # converges the same way as everyone else.
+    await ws_manager.broadcast({
+        "type": "channel_deleted",
+        "data": {"channel_id": channel_id, "name": ch["name"]},
+    })
+    return {"ok": True, "removed_files": removed_files}
 
 @router.post("/api/chat/channels/{channel_id}/join")
 async def join_channel_route(channel_id: int, session: dict = Depends(get_session_user)):

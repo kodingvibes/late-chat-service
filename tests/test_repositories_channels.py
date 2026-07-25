@@ -1,9 +1,10 @@
+import os
 import time
 import pytest
 from core.db import db
 from repositories.channels import (
     list_channels, get_channel, create_channel, update_channel,
-    join_channel, leave_channel, is_member,
+    join_channel, leave_channel, is_member, delete_channel,
 )
 
 
@@ -144,3 +145,83 @@ def test_is_member(consume_admin_slot, make_session):
         lobby = conn.execute("SELECT id FROM channels WHERE name = '#lobby'").fetchone()
     assert is_member(lobby["id"], user["id"]) is True
     assert is_member(99999, user["id"]) is True
+
+
+def test_delete_channel_cascades_everything(consume_admin_slot, make_session):
+    # ponytail: schema has no FK constraints, so without an explicit
+    # cascade the channel row deletion would orphan messages,
+    # members, reactions, attachments, and voice notes. The
+    # delete_channel repository function must wipe every related
+    # row so listChannels can't surface a ghost on a stale id.
+    from repositories.messages import send_message
+    from repositories.reactions import toggle_reaction
+    _, user = make_session()
+    _, other = make_session(sub="other-del", email="other-del@example.com", name="OtherDel")
+    ch = create_channel("#cascade", "Cascade", True, user["id"])
+    msg = send_message(ch["id"], user["id"], "hello")
+    # toggle twice to guarantee the row exists (first call adds,
+    # second removes). Easier: insert a reaction row directly.
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, 'heart', ?)",
+            (msg["id"], other["id"], int(time.time())),
+        )
+    with db() as conn:
+        # Seed a fake attachment and a fake voice note row plus a
+        # file on disk. We don't go through the upload path; the
+        # delete must clean the row even if storage_path is
+        # relative. Create the file in a temp dir under
+        # ATTACHMENT_DIR.
+        from core.config import ATTACHMENT_DIR
+        os.makedirs(ATTACHMENT_DIR, exist_ok=True)
+        att_path = "test-cascade-att.bin"
+        with open(os.path.join(ATTACHMENT_DIR, att_path), "w") as f:
+            f.write("blob")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO attachments (id, channel_id, user_id, kind, filename, mime, size_bytes, storage_path, created_at, expires_at) "
+            "VALUES (?, ?, ?, 'image', 'a.png', 'image/png', 4, ?, ?, ?)",
+            ("att-1", ch["id"], user["id"], att_path, now, now + 86400),
+        )
+        vn_path = "test-cascade-vn.webm"
+        with open(os.path.join(ATTACHMENT_DIR, vn_path), "w") as f:
+            f.write("audio")
+        conn.execute(
+            "INSERT INTO voice_notes (id, user_id, channel_id, duration_ms, amount, size_bytes, storage_path, mime, created_at) "
+            "VALUES (?, ?, ?, 1000, 50, 5, ?, 'audio/webm', ?)",
+            ("vn-1", user["id"], ch["id"], vn_path, now),
+        )
+        conn.execute(
+            "INSERT INTO message_delivered (message_id, user_id, delivered_at) VALUES (?, ?, ?)",
+            (msg["id"], other["id"], now),
+        )
+        conn.execute(
+            "INSERT INTO message_reads (message_id, user_id, read_at) VALUES (?, ?, ?)",
+            (msg["id"], other["id"], now),
+        )
+
+    removed = delete_channel(ch["id"])
+    assert removed == 2  # the two files we wrote
+
+    with db() as conn:
+        assert conn.execute("SELECT id FROM channels WHERE id = ?", (ch["id"],)).fetchone() is None
+        assert conn.execute("SELECT id FROM messages WHERE channel_id = ?", (ch["id"],)).fetchone() is None
+        assert conn.execute("SELECT message_id FROM reactions WHERE message_id = ?", (msg["id"],)).fetchone() is None
+        assert conn.execute("SELECT message_id FROM message_delivered WHERE message_id = ?", (msg["id"],)).fetchone() is None
+        assert conn.execute("SELECT message_id FROM message_reads WHERE message_id = ?", (msg["id"],)).fetchone() is None
+        assert conn.execute("SELECT user_id FROM channel_members WHERE channel_id = ?", (ch["id"],)).fetchone() is None
+        assert conn.execute("SELECT id FROM attachments WHERE channel_id = ?", (ch["id"],)).fetchone() is None
+        assert conn.execute("SELECT id FROM voice_notes WHERE channel_id = ?", (ch["id"],)).fetchone() is None
+
+    # ponytail: files on disk unlinked. We don't care if the
+    # row was missing storage_path; the unlink is best-effort.
+    assert not os.path.exists(os.path.join(ATTACHMENT_DIR, att_path))
+    assert not os.path.exists(os.path.join(ATTACHMENT_DIR, vn_path))
+
+
+def test_delete_channel_missing_returns_zero(consume_admin_slot, make_session):
+    # ponytail: deleting a non-existent channel is a no-op, not
+    # an error. The router checks get_channel first to return 404,
+    # but the repository helper itself just reports "nothing
+    # changed" so callers that bypass the router don't crash.
+    assert delete_channel(99999) == 0

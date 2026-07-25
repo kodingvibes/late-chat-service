@@ -1,6 +1,11 @@
+import os
 import time
+import logging
+import core.config
 from core.db import db
 from services.broadcaster import ws_manager
+
+log = logging.getLogger(__name__)
 
 
 def list_channels(user_id: int, global_role: str = "user") -> list[dict]:
@@ -146,3 +151,95 @@ def leave_channel(channel_id: int, user_id: int):
 # for the few routers that still import it.
 def is_member(channel_id: int, user_id: int) -> bool:
     return True
+
+
+def delete_channel(channel_id: int) -> int:
+    """Hard-delete a channel and everything tied to it: messages,
+    reactions, attachments, voice notes, receipts, channel_members.
+
+    Returns the number of storage files removed from disk so the
+    caller can log it. The DB cleanup is unconditional; the
+    schema has no FK constraints (PRAGMA foreign_keys is on but
+    nothing REFERENCES channels.id), so without an explicit
+    cascade the channel row would leave messages, members, and
+    attachments orphaned — and the next listChannels call would
+    surface channels whose only remaining rows are ghosts.
+
+    The on-disk attachment files (uploaded blobs, voice notes)
+    are unlinked best-effort: a missing file is not an error.
+    """
+    removed_files = 0
+    with db() as conn:
+        # ponytail: gather the file paths BEFORE the transaction
+        # deletes the rows, otherwise we lose the storage_path
+        # values we need to unlink.
+        att_rows = conn.execute(
+            "SELECT storage_path FROM attachments WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchall()
+        vn_rows = conn.execute(
+            "SELECT storage_path FROM voice_notes WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchall()
+
+        # ponytail: order matters less here because the schema
+        # has no FKs, but we delete in a clear outside-in order
+        # so a partial failure leaves a recognizable state.
+        # 1) per-message derived rows
+        msg_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM messages WHERE channel_id = ?", (channel_id,),
+            ).fetchall()
+        ]
+        if msg_ids:
+            placeholders = ",".join("?" * len(msg_ids))
+            for table in ("reactions", "message_delivered", "message_reads"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE message_id IN ({placeholders})",
+                    msg_ids,
+                )
+        # 2) messages themselves
+        conn.execute("DELETE FROM messages WHERE channel_id = ?", (channel_id,))
+        # 3) channel-level rows
+        conn.execute("DELETE FROM channel_members WHERE channel_id = ?", (channel_id,))
+        conn.execute("DELETE FROM attachments WHERE channel_id = ?", (channel_id,))
+        conn.execute("DELETE FROM voice_notes WHERE channel_id = ?", (channel_id,))
+        # 4) finally the channel row
+        cur = conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+        if cur.rowcount == 0:
+            return 0
+
+    # ponytail: storage cleanup happens OUTSIDE the transaction
+    # so an unlink failure can't roll back the DB delete (the
+    # DB is the source of truth; orphaned files are recovered
+    # by the TTL sweeper). Read ATTACHMENT_DIR via core.config
+    # so monkeypatch in tests (and live env reloads) are picked
+    # up at call time, not at import time.
+    attachment_dir = core.config.ATTACHMENT_DIR
+    for r in att_rows:
+        rel = r["storage_path"]
+        if not rel:
+            continue
+        path = rel if os.path.isabs(rel) else os.path.join(attachment_dir, rel)
+        try:
+            os.remove(path)
+            removed_files += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("delete_channel: failed to unlink attachment %s: %s", path, e)
+
+    for r in vn_rows:
+        rel = r["storage_path"]
+        if not rel:
+            continue
+        path = rel if os.path.isabs(rel) else os.path.join(attachment_dir, rel)
+        try:
+            os.remove(path)
+            removed_files += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("delete_channel: failed to unlink voice note %s: %s", path, e)
+
+    return removed_files
