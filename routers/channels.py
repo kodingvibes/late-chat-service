@@ -65,9 +65,10 @@ async def update_channel_route(channel_id: int, req: UpdateChannelRequest, sessi
     # channels around. Super admin bypasses the per-channel check.
     if not is_global_admin(session):
         role = get_channel_role(channel_id, session["user_id"])
-        if role != "admin":
+        if role not in ("admin", "mod"):
             raise HTTPException(403, "Only admins can update a channel")
-    update_channel(channel_id, {"category_id": req.category_id, "position": req.position})
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    update_channel(channel_id, patch)
     return {"ok": True}
 
 @router.delete("/api/chat/channels/{channel_id}")

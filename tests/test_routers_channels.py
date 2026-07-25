@@ -62,12 +62,90 @@ class TestCreateChannel:
 
 
 class TestUpdateChannel:
-    async def test_update(self, client, auth_headers):
-        headers, user = auth_headers
+    async def test_update(self, client, consume_admin_slot, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
         ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
         r = await client.patch(f"/api/chat/channels/{ch['id']}", json={"position": 5}, headers=headers)
         assert r.status_code == 200
         assert r.json()["ok"] is True
+
+    async def test_update_description(self, client, consume_admin_slot, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"description": "Nuevo topic de prueba"},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        ch2 = next(c for c in (await client.get("/api/chat/channels", headers=headers)).json() if c["id"] == ch["id"])
+        assert ch2["description"] == "Nuevo topic de prueba"
+
+    async def test_update_description_clears_with_empty(self, client, consume_admin_slot, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"description": "algo"},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        r2 = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"description": ""},
+            headers=headers,
+        )
+        assert r2.status_code == 200
+        ch2 = next(c for c in (await client.get("/api/chat/channels", headers=headers)).json() if c["id"] == ch["id"])
+        assert ch2["description"] is None
+
+    async def test_update_description_as_mod(self, client, consume_admin_slot, make_session):
+        # Make the second user a mod of the lobby channel.
+        mod_session, mod_user = make_session("mod-sub", "mod@example.com", "Mod")
+        from core.db import db
+        with db() as conn:
+            lobby = conn.execute("SELECT id FROM channels WHERE name = '#lobby'").fetchone()
+            conn.execute(
+                "UPDATE channel_members SET role = 'mod' WHERE channel_id = ? AND user_id = ?",
+                (lobby["id"], mod_user["id"]),
+            )
+        h = {"Authorization": f"Bearer {mod_session}"}
+        r = await client.patch(
+            f"/api/chat/channels/{lobby['id']}",
+            json={"description": "desde mod"},
+            headers=h,
+        )
+        assert r.status_code == 200
+
+    async def test_update_description_as_plain_user_forbidden(self, client, consume_admin_slot, make_session, auth_headers):
+        attacker_session, _ = make_session("plain-attacker", "plain@example.com", "Plain")
+        h = {"Authorization": f"Bearer {attacker_session}"}
+        headers, _ = auth_headers
+        lobby = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{lobby['id']}",
+            json={"description": "no me dejan"},
+            headers=h,
+        )
+        assert r.status_code == 403
 
 
 class TestJoinLeave:

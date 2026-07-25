@@ -122,6 +122,17 @@ def update_channel(channel_id: int, patch: dict):
         if "position" in patch:
             updates.append("position = ?")
             params.append(patch["position"])
+        if "description" in patch:
+            # ponytail: explicit NULL when the client sends "" so the
+            # field clears properly. Pydantic already turns null into
+            # None, but "" arrives as the empty string and we treat
+            # that as "no description" too.
+            value = patch["description"]
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                updates.append("description = NULL")
+            else:
+                updates.append("description = ?")
+                params.append(value)
         if updates:
             params.append(channel_id)
             conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE id = ?", params)

@@ -46,6 +46,7 @@ class UpdateCategoryRequest(BaseModel):
 class UpdateChannelRequest(BaseModel):
     category_id: int | None = None
     position: int | None = None
+    description: str | None = None
 
 class InviteRequest(BaseModel):
     email: str
