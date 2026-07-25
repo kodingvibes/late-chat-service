@@ -53,3 +53,9 @@ python -m pytest tests/
 
 [auth]: https://github.com/kodingvibes/late-auth-service
 
+
+## Operational notes
+
+- 1-ago-2026: /data/chat-bridge is the pre-extraction SQLite path. If
+  the late-chat-service container has been running cleanly for a week,
+  drop the safety-net directory: \`rm -rf /data/chat-bridge\`.
