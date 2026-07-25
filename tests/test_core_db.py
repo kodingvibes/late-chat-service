@@ -1,3 +1,4 @@
+import time
 import pytest
 from core.db import get_db, _run_migrations, _seed_categories, _seed_channels
 
@@ -132,3 +133,78 @@ def test_seed_channels_backfills_flag_on_existing_db():
     _seed_channels(conn)
     count_after_again = conn.execute("SELECT COUNT(*) as c FROM channels").fetchone()["c"]
     assert count_after == count_after_again
+
+
+def test_ensure_unique_channel_name_collapses_duplicates():
+    # ponytail: the live DB predates the UNIQUE on channels.name
+    # (the table was created with an older schema version), and
+    # the old seeder ran on every container restart, so production
+    # has hundreds of duplicate seed channels. The migration that
+    # adds the index must collapse the duplicates first, reassigning
+    # FK references from the duplicates to the lowest-id copy, so
+    # an admin's hard-delete of one copy no longer leaves 255
+    # ghosts in the channel list.
+    #
+    # We model the bad state by recreating the channels table
+    # WITHOUT the UNIQUE on name (so we can insert duplicates
+    # like the production DB does), then re-running the
+    # migration. _ensure_unique_channel_name must detect the
+    # duplicates, collapse them, and create the index.
+    conn = get_db()
+    # ponytail: the test DB is fresh, so the current schema has
+    # the column-level UNIQUE on name. Production didn't — its
+    # table predates the UNIQUE-bearing schema. Recreate the
+    # table without UNIQUE to mirror production. The autoindex
+    # sqlite_autoindex_channels_1 is what enforces the column-
+    # level UNIQUE; dropping it plus the new explicit index is
+    # what removes the constraint.
+    conn.executescript("""
+        DROP TABLE IF EXISTS channels;
+        CREATE TABLE channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            is_public INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at INTEGER NOT NULL
+        );
+        DROP INDEX IF EXISTS idx_channels_name;
+    """)
+    conn.execute("DELETE FROM meta WHERE key = 'channels_seeded'")
+    # Insert duplicates of #lobby. With UNIQUE gone, this works.
+    now = int(time.time())
+    for extra_id in (1000, 1001, 1002):
+        conn.execute(
+            "INSERT INTO channels (id, name, description, is_public, created_at) VALUES (?, '#lobby', 'dup', 1, ?)",
+            (extra_id, now),
+        )
+        conn.execute(
+            "INSERT INTO messages (channel_id, user_id, content, created_at) VALUES (?, 1, 'orphan-msg', ?)",
+            (extra_id, now),
+        )
+    conn.commit()
+    # Sanity check: we have three #lobby rows and no UNIQUE index.
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM channels WHERE name = '#lobby'"
+    ).fetchone()["c"] == 3
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_channels_name'"
+    ).fetchone() is None
+    # Re-run the migration. _ensure_unique_channel_name must
+    # detect the duplicates, collapse them (reassigning the
+    # messages to the original #lobby), and create the index.
+    _run_migrations(conn)
+    # The UNIQUE index now exists.
+    idx = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_channels_name'"
+    ).fetchone()
+    assert idx is not None
+    # Only one #lobby remains.
+    rows = conn.execute("SELECT id, name FROM channels WHERE name = '#lobby'").fetchall()
+    assert len(rows) == 1
+    kept_id = rows[0]["id"]
+    # The orphan messages now belong to the kept row.
+    orphans = conn.execute(
+        "SELECT channel_id FROM messages WHERE content = 'orphan-msg'"
+    ).fetchall()
+    assert all(o["channel_id"] == kept_id for o in orphans)

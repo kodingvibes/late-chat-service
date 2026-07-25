@@ -1,7 +1,10 @@
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
 from core.config import SQLITE_PATH
+
+log = logging.getLogger(__name__)
 
 # ponytail: chat-bridge no longer owns users or sessions. The
 # actual identity lives in late-auth-service
@@ -144,6 +147,18 @@ def _run_migrations(conn):
     _run_idempotent_alter(conn, "channels", "channel_type", "TEXT NOT NULL DEFAULT 'text'")
     _run_idempotent_alter(conn, "channels", "category_id", "INTEGER")
     _run_idempotent_alter(conn, "channels", "position", "INTEGER NOT NULL DEFAULT 0")
+    # ponytail: enforce a UNIQUE index on channels.name. The CREATE
+    # TABLE above declares it, but production tables predate that
+    # version, so CREATE TABLE IF NOT EXISTS is a no-op and the
+    # column-level UNIQUE is missing. Without this index, the
+    # seeder (when it ran on every restart) silently produced
+    # hundreds of duplicate seed channels — the admin's hard-
+    # delete dropped one of them, the next listChannels call
+    # surfaced the rest. Adding the index now makes the constraint
+    # real; if duplicates are already in the table, the CREATE
+    # INDEX fails and we collapse them first (reassigning FK
+    # references) before retrying.
+    _ensure_unique_channel_name(conn)
     _seed_categories(conn)
     _seed_channels(conn)
 
@@ -153,6 +168,87 @@ def _run_idempotent_alter(conn, table, column, col_type):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
     except sqlite3.OperationalError:
         pass
+
+
+# ponytail: every table that holds a `channel_id` we need to
+# rewrite when collapsing duplicate channel rows. Reactions
+# (and message_delivered / message_reads) are keyed on
+# message_id, and the message keeps its row (we just change
+# the message's channel_id), so the reactions/reads/delivered
+# don't need any rewrite here.
+_CHANNEL_FK_TABLES = (
+    ("channel_members", "channel_id"),
+    ("messages", "channel_id"),
+    ("voice_notes", "channel_id"),
+    ("attachments", "channel_id"),
+)
+
+
+def _collapse_duplicate_channels(conn):
+    """Reassign FK references from duplicate channel rows to the
+    lowest-id copy of each name, then delete the duplicates. The
+    seeder ran on every container start before the UNIQUE index
+    existed, so the live table may carry hundreds of copies of
+    #lobby, #random, #dev, #infra, 🔊 General, and 🔊 Music.
+    Without this collapse, an admin's hard-delete of one copy
+    leaves the rest visible to listChannels."""
+    groups = conn.execute("""
+        SELECT name, MIN(id) AS kept_id
+        FROM channels
+        GROUP BY name
+        HAVING COUNT(*) > 1
+    """).fetchall()
+    if not groups:
+        return 0
+    total_collapsed = 0
+    for name, kept_id in groups:
+        dup_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM channels WHERE name = ? AND id != ?",
+            (name, kept_id),
+        ).fetchall()]
+        if not dup_ids:
+            continue
+        placeholders = ",".join("?" * len(dup_ids))
+        update_params = [kept_id] + dup_ids
+        for table, col in _CHANNEL_FK_TABLES:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            )
+            if not cur.fetchone():
+                continue
+            conn.execute(
+                f"UPDATE {table} SET {col} = ? WHERE {col} IN ({placeholders})",
+                update_params,
+            )
+        conn.execute(
+            f"DELETE FROM channels WHERE id IN ({placeholders})",
+            dup_ids,
+        )
+        total_collapsed += len(dup_ids)
+    return total_collapsed
+
+
+def _ensure_unique_channel_name(conn):
+    """Create idx_channels_name if missing. If duplicates are in
+    the way, collapse them first (which reassigns FK references
+    from duplicates to the kept row) and retry."""
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_name ON channels(name)")
+        return
+    except sqlite3.IntegrityError:
+        pass
+    # ponytail: duplicates blocked the index. Collapse and retry.
+    # Wrap in a savepoint so a half-collapsed state doesn't leak
+    # out if the second attempt also fails for some reason.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        collapsed = _collapse_duplicate_channels(conn)
+        if collapsed:
+            log.warning("collapsed %d duplicate channel rows before adding idx_channels_name", collapsed)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_name ON channels(name)")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _seed_categories(conn):
