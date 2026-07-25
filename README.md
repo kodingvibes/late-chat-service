@@ -52,3 +52,4 @@ python -m pytest tests/
 ```
 
 [auth]: https://github.com/kodingvibes/late-auth-service
+
