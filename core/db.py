@@ -108,6 +108,18 @@ def _run_migrations(conn):
             mime TEXT NOT NULL DEFAULT 'audio/webm',
             created_at INTEGER NOT NULL
         );
+        -- ponytail: one-row meta table. Holds flags that must survive
+        -- across restarts. The previous design re-ran the channel
+        -- seeder on every container start, which silently re-inserted
+        -- any seed channel an admin had hard-deleted (INSERT OR IGNORE
+        -- only checks for an existing row — it has no idea if a row
+        -- was deleted on purpose). Stamping `seeded=1` here is what
+        -- makes the seeder a one-time migration instead of a recurring
+        -- resurrection.
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
     _run_idempotent_alter(conn, "channel_members", "role", "TEXT")
     _run_idempotent_alter(conn, "messages", "reply_to", "INTEGER")
@@ -160,6 +172,23 @@ def _seed_categories(conn):
 
 
 def _seed_channels(conn):
+    # ponytail: this used to run on every container start and
+    # `INSERT OR IGNORE` re-inserted any seed channel (#lobby,
+    # #random, #dev, #infra, 🔊 General, 🔊 Music) that an admin
+    # had hard-deleted. To the user the delete looked like a no-op:
+    # the row vanished from the sidebar, but the next deploy or
+    # restart resurrected it. The flag in the meta table makes
+    # the seed a one-time migration.
+    #
+    # Pre-existing databases that already have all six seed
+    # channels installed are stamped as "seeded" too, so this
+    # change is a no-op for them — the only difference is that
+    # from now on, deleting a seed channel stays deleted.
+    already = conn.execute(
+        "SELECT value FROM meta WHERE key = 'channels_seeded'"
+    ).fetchone()
+    if already:
+        return
     now = int(time.time())
     for name, desc, ch_type in [
         ("#lobby", "General chat", "text"),
@@ -178,6 +207,9 @@ def _seed_channels(conn):
         )
     # ponytail: voice channels are public; any authenticated user
     # joins on demand when they first interact with one.
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('channels_seeded', '1')"
+    )
     conn.commit()
 
 

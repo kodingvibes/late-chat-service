@@ -82,3 +82,53 @@ def test_all_tables_exist():
     # baseline schema.
     for t in expected:
         assert t in tables, f"Missing table: {t}"
+
+
+def test_seed_channels_does_not_resurrect_deleted_seeds():
+    # ponytail: the seeder used to run on every container start with
+    # INSERT OR IGNORE, which silently re-inserted any seed channel
+    # (#lobby, #random, #dev, #infra, 🔊 General, 🔊 Music) that an
+    # admin had hard-deleted. The flag in the meta table is what
+    # makes the seed a one-time migration.
+    conn = get_db()
+    _run_migrations(conn)
+    _seed_channels(conn)
+    # Admin hard-deletes #dev and 🔊 General.
+    conn.execute("DELETE FROM channels WHERE name IN ('#dev', '🔊 General')")
+    conn.commit()
+    # Container "restarts" — seeder runs again.
+    _seed_channels(conn)
+    rows = conn.execute("SELECT name FROM channels").fetchall()
+    names = [r["name"] for r in rows]
+    assert "#dev" not in names
+    assert "🔊 General" not in names
+    # The other seeds are still there because they were never
+    # deleted.
+    assert "#lobby" in names
+    assert "#random" in names
+    assert "#infra" in names
+    assert "🔊 Music" in names
+
+
+def test_seed_channels_backfills_flag_on_existing_db():
+    # ponytail: pre-existing databases that already had all six
+    # seed channels installed predate the meta flag. On the first
+    # migration run, the seeder should detect the absence of the
+    # flag, do nothing, and stamp the flag so future restarts
+    # stay one-time.
+    conn = get_db()
+    _run_migrations(conn)
+    # Simulate a pre-existing DB that already has channels but
+    # no meta row yet.
+    conn.execute("DELETE FROM meta WHERE key = 'channels_seeded'")
+    conn.commit()
+    assert conn.execute("SELECT value FROM meta WHERE key = 'channels_seeded'").fetchone() is None
+    _seed_channels(conn)
+    # Flag is stamped, channel count is unchanged.
+    flag = conn.execute("SELECT value FROM meta WHERE key = 'channels_seeded'").fetchone()
+    assert flag is not None
+    count_after = conn.execute("SELECT COUNT(*) as c FROM channels").fetchone()["c"]
+    # Re-running the seeder must be a no-op now.
+    _seed_channels(conn)
+    count_after_again = conn.execute("SELECT COUNT(*) as c FROM channels").fetchone()["c"]
+    assert count_after == count_after_again
