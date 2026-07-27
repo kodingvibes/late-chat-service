@@ -64,6 +64,16 @@ app.add_middleware(
 async def healthz():
     return {"ok": True}
 
+
+# ponytail: global online count for the shell. Counts unique user_ids
+# with at least one open websocket connection. Unauthenticated on
+# purpose — the count is the same number the badge already shows
+# inside the chat micro, and the shell polls it on initial load so
+# the header badge is populated before the user navigates to /irc.
+@app.get("/api/chat/online-count")
+async def online_count():
+    return {"count": len(ws_manager.connections)}
+
 from routers.channels import router as channels_router
 from routers.messages import router as messages_router
 from routers.reactions import router as reactions_router
