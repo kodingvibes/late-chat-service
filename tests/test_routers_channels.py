@@ -199,6 +199,133 @@ class TestInvite:
         assert r.status_code == 404
 
 
+class TestRenameChannel:
+    async def test_rename_as_admin(self, client, consume_admin_slot, auth_headers, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": "#renombrado"},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        ch2 = next(c for c in (await client.get("/api/chat/channels", headers=headers)).json() if c["id"] == ch["id"])
+        assert ch2["name"] == "#renombrado"
+
+    async def test_rename_auto_prefix_hash(self, client, consume_admin_slot, auth_headers, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        # Send without the leading "#"; the router must auto-prefix.
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": "sinhash"},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        ch2 = next(c for c in (await client.get("/api/chat/channels", headers=headers)).json() if c["id"] == ch["id"])
+        assert ch2["name"] == "#sinhash"
+
+    async def test_rename_duplicate_returns_409(self, client, consume_admin_slot, auth_headers, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        # Create a second channel so we have a name to collide with.
+        r = await client.post("/api/chat/channels", json={"name": "#ya-existe"}, headers=headers)
+        assert r.status_code == 200
+        other_id = r.json()["id"]
+        # Try to rename another channel to that same name.
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": "#ya-existe"},
+            headers=headers,
+        )
+        assert r.status_code == 409
+        # Original channel keeps its name unchanged.
+        ch_unchanged = next(c for c in (await client.get("/api/chat/channels", headers=headers)).json() if c["id"] == ch["id"])
+        assert ch_unchanged["name"] == ch["name"]
+        # Confirm the new channel is intact too.
+        other_ch = next(c for c in (await client.get("/api/chat/channels", headers=headers)).json() if c["id"] == other_id)
+        assert other_ch["name"] == "#ya-existe"
+
+    async def test_rename_invalid_format_returns_400(self, client, consume_admin_slot, auth_headers, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": "bad name!"},
+            headers=headers,
+        )
+        assert r.status_code == 400
+
+    async def test_rename_too_long_returns_400(self, client, consume_admin_slot, auth_headers, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": "a" * 41},
+            headers=headers,
+        )
+        assert r.status_code == 400
+
+    async def test_rename_as_plain_user_forbidden(self, client, consume_admin_slot, auth_headers, make_session):
+        attacker_session, _ = make_session("attacker-rename", "attacker-rename@example.com", "Attacker")
+        h2 = {"Authorization": f"Bearer {attacker_session}"}
+        headers, _ = auth_headers
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": "#hack"},
+            headers=h2,
+        )
+        assert r.status_code == 403
+
+    async def test_rename_same_name_is_noop(self, client, consume_admin_slot, auth_headers, make_session, mock_late_auth):
+        from core.auth import generate_session_id
+        from tests.conftest import _create_test_user  # type: ignore
+        admin = _create_test_user(sub="__admin_consumer__", email="admin-consumer@example.com", name="Admin Consumer", user_id=consume_admin_slot)
+        admin_session = {**admin, "global_role": "super_admin"}
+        admin_token = generate_session_id()
+        mock_late_auth.register(admin_token, admin_session)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        ch = (await client.get("/api/chat/channels", headers=headers)).json()[0]
+        r = await client.patch(
+            f"/api/chat/channels/{ch['id']}",
+            json={"name": ch["name"]},
+            headers=headers,
+        )
+        # same name = no-op, no integrity error
+        assert r.status_code == 200
+
+
 class TestMarkRead:
     async def test_mark_read(self, client, auth_headers):
         headers, user = auth_headers

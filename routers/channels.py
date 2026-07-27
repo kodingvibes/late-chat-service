@@ -68,7 +68,37 @@ async def update_channel_route(channel_id: int, req: UpdateChannelRequest, sessi
         if role not in ("admin", "mod"):
             raise HTTPException(403, "Only admins can update a channel")
     patch = {k: v for k, v in req.model_dump().items() if v is not None}
-    update_channel(channel_id, patch)
+    # ponytail: rename validation lives here, not in the repository,
+    # so the error message matches the rest of the channel create
+    # flow (and so the router can return a 400 on bad format vs.
+    # 409 on duplicate). The repository only enforces the DB-level
+    # UNIQUE constraint on channels.name and lets IntegrityError
+    # bubble.
+    if "name" in patch:
+        name = patch["name"].strip()
+        if not name.startswith("#"):
+            name = "#" + name
+        if len(name) > 40 or not name[1:].replace("_", "").replace("-", "").isalnum():
+            raise HTTPException(400, "Invalid channel name")
+        ch = get_channel(channel_id)
+        if not ch:
+            raise HTTPException(404, "Channel not found")
+        if ch["channel_type"] == "voice":
+            raise HTTPException(400, "Voice channels can't be renamed")
+        if ch["name"] == name:
+            patch.pop("name", None)  # no-op rename, skip the SQL
+        else:
+            patch["name"] = name
+    if not patch:
+        return {"ok": True}
+    try:
+        update_channel(channel_id, patch)
+    except Exception as e:
+        # channels.name UNIQUE catches duplicate renames; surface as 409
+        # so the client can show "name already in use" instead of 500.
+        if "UNIQUE" in str(e) or "name" in str(e).lower():
+            raise HTTPException(409, "Channel name already in use")
+        raise
     return {"ok": True}
 
 @router.delete("/api/chat/channels/{channel_id}")

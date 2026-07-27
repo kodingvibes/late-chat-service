@@ -133,6 +133,13 @@ def update_channel(channel_id: int, patch: dict):
             else:
                 updates.append("description = ?")
                 params.append(value)
+        if "name" in patch:
+            # ponytail: name lives in the channels.name UNIQUE column.
+            # The UNIQUE constraint catches duplicates at commit
+            # time; we let sqlite3.IntegrityError bubble up so the
+            # router can translate it to a 409.
+            updates.append("name = ?")
+            params.append(patch["name"])
         if updates:
             params.append(channel_id)
             conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE id = ?", params)
