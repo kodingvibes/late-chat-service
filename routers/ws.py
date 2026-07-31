@@ -86,34 +86,43 @@ async def chat_ws(ws: WebSocket, token: str = None):
                     await voice_rooms.join(user_id, room_id)
                     peers = await voice_rooms.peers_with_names(user_id)
                     await ws.send_text(json.dumps({"type": "voice.peers", "data": {"peers": peers}}))
-                    await voice_rooms.broadcast(user_id, {"type": "voice.peer_joined", "data": {"user_id": user_id, "display_name": user.get("display_name")}})
+                    # `user` comes from /validate, which strips the
+                    # avatar, so resolve our own through the cache the
+                    # same way the roster does.
+                    me = (await voice_rooms.describe([user_id]))[0]
+                    await voice_rooms.broadcast(user_id, {"type": "voice.peer_joined", "data": {"user_id": user_id, "display_name": user.get("display_name") or me["display_name"], "avatar_url": me["avatar_url"]}})
                 elif t == "voice.leave":
-                    await voice_rooms.leave(user_id)
+                    # Broadcast BEFORE leaving: broadcast() resolves the
+                    # room via user_room[user_id], which leave() pops, so
+                    # the old order delivered peer_left to nobody and every
+                    # remaining client kept a dead tile and a live
+                    # RTCPeerConnection until ICE consent expired.
                     await voice_rooms.broadcast(user_id, {"type": "voice.peer_left", "data": {"user_id": user_id, "display_name": user.get("display_name")}})
+                    await voice_rooms.leave(user_id)
                 elif t == "voice.offer":
                     target = msg.get("to")
-                    if target:
+                    if target and await voice_rooms.same_room(user_id, target):
                         await ws_manager.send_to_user(target, {"type": "voice.offer", "data": {"from": user_id, "from_display_name": user.get("display_name"), "sdp": msg.get("sdp")}})
                 elif t == "voice.answer":
                     target = msg.get("to")
-                    if target:
+                    if target and await voice_rooms.same_room(user_id, target):
                         await ws_manager.send_to_user(target, {"type": "voice.answer", "data": {"from": user_id, "from_display_name": user.get("display_name"), "sdp": msg.get("sdp")}})
                 elif t == "voice.ice":
                     target = msg.get("to")
-                    if target:
+                    if target and await voice_rooms.same_room(user_id, target):
                         await ws_manager.send_to_user(target, {"type": "voice.ice", "data": {"from": user_id, "from_display_name": user.get("display_name"), "candidate": msg.get("candidate")}})
                 elif t == "voice.hangup":
-                    await voice_rooms.leave(user_id)
                     await voice_rooms.broadcast(user_id, {"type": "voice.hangup", "data": {"user_id": user_id}})
+                    await voice_rooms.leave(user_id)
                 elif t == "voice.peer_volume":
                     target = msg.get("to")
                     volume = msg.get("volume")
-                    if target and volume is not None:
+                    if target and volume is not None and await voice_rooms.same_room(user_id, target):
                         await ws_manager.send_to_user(target, {"type": "voice.peer_volume", "data": {"from": user_id, "volume": volume}})
                 elif t == "voice.peer_local_mute":
                     target = msg.get("to")
                     muted = msg.get("muted")
-                    if target and muted is not None:
+                    if target and muted is not None and await voice_rooms.same_room(user_id, target):
                         await ws_manager.send_to_user(target, {"type": "voice.peer_local_mute", "data": {"from": user_id, "muted": muted}})
                 elif t == "voice.peer_kick":
                     target = msg.get("target_user_id")
@@ -121,10 +130,15 @@ async def chat_ws(ws: WebSocket, token: str = None):
                     if target and channel_id_for_voice:
                         with db() as conn:
                             caller_role = conn.execute("SELECT role FROM channel_members WHERE channel_id = ? AND user_id = ?", (channel_id_for_voice, user_id)).fetchone()
-                        if caller_role and caller_role["role"] == "admin":
+                        # The caller admins `channel_id_for_voice`, but
+                        # leave() is room-agnostic, so without this the
+                        # admin of any channel could evict anyone from any
+                        # other channel's call.
+                        target_room = voice_rooms.user_room.get(target)
+                        if caller_role and caller_role["role"] == "admin" and target_room == str(channel_id_for_voice):
                             await ws_manager.send_to_user(target, {"type": "voice.kicked", "data": {"by": user_id, "by_display_name": user.get("display_name"), "channel_id": channel_id_for_voice}})
-                            await voice_rooms.leave(target)
                             await voice_rooms.broadcast(target, {"type": "voice.peer_left", "data": {"user_id": target, "display_name": ""}})
+                            await voice_rooms.leave(target)
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:

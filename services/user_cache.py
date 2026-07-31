@@ -45,7 +45,20 @@ def _store(user_id: int, payload: dict) -> None:
 
 
 def _empty() -> dict:
-    return {"display_name": "", "email": ""}
+    # "" not None: a failed or not-found lookup is a real answer and
+    # should cache negatively. None is reserved for prime() below.
+    return {"display_name": "", "email": "", "avatar_url": ""}
+
+
+# ponytail: `avatar_url` is None for "we never asked" and a string
+# (possibly "") for "late-auth answered". The distinction matters
+# because prime() fills entries from a validated session, and
+# /api/auth/validate deliberately strips the avatar - without it, one
+# message sent by a user would poison the cache for 5 minutes and drop
+# them out of the voice roster with a blank tile. Callers that need the
+# avatar pass need_avatar=True and an unasked entry counts as a miss.
+def _has_avatar_field(entry: Optional[dict]) -> bool:
+    return entry is not None and entry.get("avatar_url") is not None
 
 
 def fetch_user(user_id: int) -> dict:
@@ -70,6 +83,9 @@ def fetch_user(user_id: int) -> dict:
             payload = {
                 "display_name": data.get("display_name", "") or "",
                 "email": data.get("email", "") or "",
+                # /users/{id} strips the avatar by design, so this is
+                # always "". Only /users/batch carries a real one.
+                "avatar_url": data.get("avatar_url") or "",
             }
             _store(user_id, payload)
             return payload
@@ -80,17 +96,20 @@ def fetch_user(user_id: int) -> dict:
     return payload
 
 
-def fetch_users(user_ids: list[int]) -> dict[int, dict]:
-    """Return {user_id: {display_name, email}} for the given ids.
+def fetch_users(user_ids: list[int], need_avatar: bool = False) -> dict[int, dict]:
+    """Return {user_id: {display_name, email, avatar_url}} for the ids.
 
     Cached entries are returned synchronously; misses go to late-auth
     in a single batched call. Empty strings on any failure.
+
+    `need_avatar=True` (the voice roster) also treats an entry that was
+    primed from a session as a miss, because those carry no avatar.
     """
     out: dict[int, dict] = {}
     misses: list[int] = []
     for uid in user_ids:
         cached = get_cached(uid)
-        if cached is not None:
+        if cached is not None and (not need_avatar or _has_avatar_field(cached)):
             out[uid] = cached
         else:
             misses.append(uid)
@@ -111,6 +130,7 @@ def fetch_users(user_ids: list[int]) -> dict[int, dict]:
                         payload = {
                             "display_name": row.get("display_name", "") or "",
                             "email": row.get("email", "") or "",
+                            "avatar_url": row.get("avatar_url") or "",
                         }
                     else:
                         payload = _empty()
@@ -144,4 +164,6 @@ def prime(user_id: int, display_name: str = "", email: str = "") -> None:
     """
     if get_cached(user_id) is not None:
         return
-    _store(user_id, {"display_name": display_name, "email": email})
+    # avatar_url=None marks "not asked": the session this came from was
+    # validated through /api/auth/validate, which strips the avatar.
+    _store(user_id, {"display_name": display_name, "email": email, "avatar_url": None})
