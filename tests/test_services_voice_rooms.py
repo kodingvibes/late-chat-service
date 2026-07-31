@@ -63,20 +63,32 @@ class TestVoiceRoomManager:
         roster = await voice_rooms.roster("nonexistent")
         assert roster == []
 
-    async def test_roster_returns_display_names(self, make_session):
-        _, user1 = make_session("sub-roster-1", "roster1@example.com", "Roster One")
-        _, user2 = make_session("sub-roster-2", "roster2@example.com", "Roster Two")
-        await voice_rooms.join(user1["id"], "lobby")
-        await voice_rooms.join(user2["id"], "lobby")
-        roster = await voice_rooms.roster("lobby")
-        expected = sorted(
-            [
-                {"user_id": user1["id"], "display_name": user1["display_name"]},
-                {"user_id": user2["id"], "display_name": user2["display_name"]},
-            ],
-            key=lambda p: p["user_id"],
-        )
-        assert roster == expected
+    async def test_roster_returns_display_names_and_avatars(self):
+        # Identity comes from late-auth via user_cache, not from a local
+        # users table (there isn't one), so seed the cache directly.
+        from services import user_cache
+        user_cache._CACHE.clear()
+        user_cache._store(41, {"display_name": "Roster One", "email": "r1@x", "avatar_url": "data:image/webp;base64,AAA"})
+        user_cache._store(42, {"display_name": "Roster Two", "email": "r2@x", "avatar_url": ""})
+        await voice_rooms.join(41, "lobby")
+        await voice_rooms.join(42, "lobby")
+        assert await voice_rooms.roster("lobby") == [
+            {"user_id": 41, "display_name": "Roster One", "avatar_url": "data:image/webp;base64,AAA"},
+            {"user_id": 42, "display_name": "Roster Two", "avatar_url": ""},
+        ]
+
+    async def test_roster_does_not_touch_the_local_db(self):
+        """Regression: roster() used to run `SELECT id, display_name FROM
+        users`, a table core/db.py no longer creates. It resolved to ""
+        for every post-split user, which is what rendered as a bare "?"
+        tile, and would raise outright on a DB without the leftover.
+        """
+        from services import user_cache
+        user_cache._CACHE.clear()
+        user_cache._store(7, {"display_name": "Cached", "email": "c@x", "avatar_url": ""})
+        await voice_rooms.join(7, "lobby")
+        with patch("core.db.db", side_effect=AssertionError("roster must not hit the chat DB")):
+            assert (await voice_rooms.roster("lobby"))[0]["display_name"] == "Cached"
 
 
 class TestBroadcastParticipantsPayload:
@@ -85,20 +97,60 @@ class TestBroadcastParticipantsPayload:
         voice_rooms.rooms.clear()
         voice_rooms.user_room.clear()
 
-    async def test_includes_participants(self, make_session):
-        _, user1 = make_session("sub-bp-1", "bp1@example.com", "BP One")
+    async def test_includes_participants(self):
+        from services import user_cache
+        user_cache._CACHE.clear()
+        user_cache._store(51, {"display_name": "BP One", "email": "bp1@x", "avatar_url": "data:image/webp;base64,BBB"})
         async with voice_rooms.lock:
-            voice_rooms.rooms.setdefault("lobby", set()).add(user1["id"])
-            voice_rooms.user_room[user1["id"]] = "lobby"
+            voice_rooms.rooms.setdefault("lobby", set()).add(51)
+            voice_rooms.user_room[51] = "lobby"
         with patch("services.voice_rooms.ws_manager.send_to_user", new=AsyncMock()) as mock_send, \
-                patch("services.voice_rooms.ws_manager.connections", {user1["id"]: object()}), \
+                patch("services.voice_rooms.ws_manager.connections", {51: object()}), \
                 patch("services.voice_rooms.ws_manager.lock", asyncio.Lock()):
             await voice_rooms._broadcast_participants("lobby")
             mock_send.assert_called_once()
             uid, payload = mock_send.call_args[0]
-            assert uid == user1["id"]
+            assert uid == 51
             assert payload["type"] == "voice.participants"
             data = payload["data"]
             assert data["room_id"] == "lobby"
             assert data["count"] == 1
-            assert data["participants"] == [{"user_id": user1["id"], "display_name": user1["display_name"]}]
+            assert data["participants"] == [
+                {"user_id": 51, "display_name": "BP One", "avatar_url": "data:image/webp;base64,BBB"}
+            ]
+
+
+class TestSignalingGuards:
+    """Regressions for two bugs that were live in production."""
+
+    @pytest.fixture(autouse=True)
+    def reset(self):
+        voice_rooms.rooms.clear()
+        voice_rooms.user_room.clear()
+
+    async def test_signaling_is_gated_on_being_in_the_same_room(self):
+        """An unsolicited voice.offer to any user_id used to be relayed
+        verbatim, and the receiving client answers offers and attaches
+        its mic - a one-way wiretap on any call from any account.
+        """
+        with patch.object(voice_rooms, "_broadcast_participants", new=AsyncMock()):
+            await voice_rooms.join(1, "room-a")
+            await voice_rooms.join(2, "room-a")
+            await voice_rooms.join(3, "room-b")
+        assert await voice_rooms.same_room(1, 2) is True
+        assert await voice_rooms.same_room(1, 3) is False   # different room
+        assert await voice_rooms.same_room(99, 1) is False  # not in voice at all
+
+    async def test_broadcast_survives_a_concurrent_join(self):
+        """broadcast() iterated the live room set across an await, so a
+        join landing mid-send raised "Set changed size during iteration"
+        out of a handler that only catches JSONDecodeError.
+        """
+        with patch.object(voice_rooms, "_broadcast_participants", new=AsyncMock()):
+            for uid in range(1, 6):
+                await voice_rooms.join(uid, "lobby")
+
+            async def mutate(_uid, _msg):
+                voice_rooms.rooms["lobby"].add(1000 + _uid)
+            with patch("services.voice_rooms.ws_manager.send_to_user", new=mutate):
+                await voice_rooms.broadcast(1, {"type": "x"})  # must not raise
