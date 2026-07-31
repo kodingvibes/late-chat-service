@@ -159,3 +159,42 @@ class TestVoiceLeaveDeliversPeerLeft:
         assert len(peer_left) == 1, "voice.peer_left was delivered to nobody"
         assert peer_left[0][0] == other["id"]
         assert peer_left[0][1]["data"]["user_id"] == me["id"]
+
+
+class TestVoiceJoinCarriesAvatar:
+    async def test_peer_joined_and_peers_carry_avatars(self, make_session):
+        """The joiner's own `user` dict comes from /api/auth/validate,
+        which strips the avatar by design, so peer_joined has to resolve
+        it through user_cache like the roster does.
+        """
+        from routers.ws import chat_ws
+        from services.voice_rooms import voice_rooms
+        from services import user_cache
+        voice_rooms.rooms.clear(); voice_rooms.user_room.clear()
+
+        _, sitting = make_session("sub-sitting", "sitting@example.com", "Sitting")
+        user_cache._store(sitting["id"], {"display_name": "Sitting", "email": "s@x",
+                                          "avatar_url": "data:image/webp;base64,SIT"})
+        await voice_rooms.join(sitting["id"], "lobby")
+
+        session_id, me = make_session()
+        user_cache._store(me["id"], {"display_name": me["display_name"], "email": "m@x",
+                                     "avatar_url": "data:image/webp;base64,ME"})
+        ws = AsyncMock(); ws.accept = AsyncMock(); ws.close = AsyncMock()
+        ws.receive_text = AsyncMock(side_effect=[
+            json.dumps({"type": "voice.join", "roomId": "lobby"}),
+            WebSocketDisconnect(code=1000),
+        ])
+        with patch("services.voice_rooms.ws_manager.send_to_user", new=AsyncMock()) as send:
+            await chat_ws(ws, token=session_id)
+
+        # What the joiner is told about who is already there.
+        sent = [json.loads(c[0][0]) for c in ws.send_text.call_args_list]
+        peers = [c for c in sent if c["type"] == "voice.peers"][0]["data"]["peers"]
+        assert peers == [{"user_id": sitting["id"], "display_name": "Sitting",
+                          "avatar_url": "data:image/webp;base64,SIT"}]
+
+        # What the room is told about the joiner.
+        joined = [c[0][1] for c in send.call_args_list if c[0][1].get("type") == "voice.peer_joined"]
+        assert len(joined) == 1
+        assert joined[0]["data"]["avatar_url"] == "data:image/webp;base64,ME"
