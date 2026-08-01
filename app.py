@@ -84,6 +84,7 @@ from routers.buzz import router as buzz_router
 from routers.webhook import router as webhook_router
 from routers.ws import router as ws_router
 from routers.link_preview import router as link_preview_router
+from routers.turn import router as turn_router
 import voice
 
 # ponytail: auth lives in late-auth-service (/api/auth/*). chat-bridge
@@ -99,4 +100,5 @@ app.include_router(buzz_router)
 app.include_router(webhook_router)
 app.include_router(ws_router)
 app.include_router(link_preview_router)
+app.include_router(turn_router)
 app.include_router(voice.router)

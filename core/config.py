@@ -25,3 +25,6 @@ LINK_PREVIEW_TTL_SECONDS = int(os.environ.get("LINK_PREVIEW_TTL_SECONDS", "21600
 # frame to decide whether to offer the Edit action, but the server is the
 # authority and re-checks it on every PATCH.
 EDIT_WINDOW_SECONDS = int(os.environ.get("EDIT_WINDOW_SECONDS", "900"))
+TURN_URL = os.environ.get("TURN_URL", "")
+TURN_USERNAME = os.environ.get("TURN_USERNAME", "")
+TURN_CREDENTIAL = os.environ.get("TURN_CREDENTIAL", "")
