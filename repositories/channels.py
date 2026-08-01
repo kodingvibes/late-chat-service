@@ -12,28 +12,28 @@ def list_channels(user_id: int, global_role: str = "user") -> list[dict]:
     with db() as conn:
         # ponytail: materialise this user's membership rows.
         #
-        # `is_member()` returns True unconditionally -- every user belongs
-        # to every channel -- and when that collapsed, the code that wrote
-        # to channel_members went with it. But 24 read sites still treat
-        # that table as the roster: the online-users panel, the member
-        # count, unread tracking, role and mute lookups, and, most
-        # importantly, broadcast_to_channel_members, which is how messages
-        # and typing indicators actually reach people.
+        # `is_member()` is unconditionally True -- everyone belongs to every
+        # channel -- and when membership collapsed to that, the writes to
+        # channel_members went with it. Nothing INSERTs into it any more,
+        # but 24 sites still read it as the roster, including
+        # broadcast_to_channel_members, which is how messages and typing
+        # reach people. So post-split users had no rows: invisible in the
+        # user list and getting no realtime traffic.
         #
-        # So anyone who signed up after that change had no rows: they were
-        # invisible in the user list AND received no realtime traffic. On a
-        # freshly seeded database the whole table is empty, which is the
-        # "0 en línea - 0 en el canal / No hay usuarios" panel.
-        #
-        # This is the cheapest place to repair it: listing channels is the
-        # first thing every client does, INSERT OR IGNORE makes it a no-op
-        # once the row exists, and it keeps the table meaning exactly what
-        # the 24 readers already assume it means.
-        conn.execute(
-            "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) "
-            "SELECT id, ?, ? FROM channels",
-            (user_id, int(time.time())),
-        )
+        # Guarded by a count so this stays a read on the hot path: the
+        # route behind it is refreshed on presence and message events, and
+        # an unconditional INSERT would take a write lock every time.
+        missing = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM channels) - "
+            "(SELECT COUNT(*) FROM channel_members WHERE user_id = ?) AS n",
+            (user_id,),
+        ).fetchone()["n"]
+        if missing:
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) "
+                "SELECT id, ?, ? FROM channels",
+                (user_id, int(time.time())),
+            )
         # ponytail: last_seen lives in late-auth now, not here.
         # Global super_admin / admin still get admin on every channel.
         # The role comes from the validated session (not a local
