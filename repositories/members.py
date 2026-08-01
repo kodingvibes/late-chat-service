@@ -23,10 +23,18 @@ def list_members(channel_id: int) -> list[dict]:
     out: list[dict] = []
     for r in rows:
         info = by_id.get(r["user_id"]) or {"display_name": "", "email": ""}
+        display_name = info.get("display_name", "") or ""
+        email = info.get("email", "") or ""
+        # ponytail: when late-auth is unreachable or the user was
+        # deleted, display_name comes back empty. Fall back to the
+        # email prefix or a placeholder so the UI never shows "?"
+        # or a blank row.
+        if not display_name:
+            display_name = email.split("@")[0] if email else f"Usuario {r['user_id']}"
         out.append({
             "id": r["user_id"],
-            "display_name": info.get("display_name", "") or "",
-            "email": info.get("email", "") or "",
+            "display_name": display_name,
+            "email": email,
             "active": ws_manager.is_online(r["user_id"]),
             "role": r["role"],
             "muted": bool(r["muted"]),
@@ -61,11 +69,15 @@ def get_member(channel_id: int, user_id: int) -> dict | None:
     if not row:
         return None
     info = fetch_users([user_id]).get(user_id) or {"display_name": "", "email": ""}
+    display_name = info.get("display_name", "") or ""
+    email = info.get("email", "") or ""
+    if not display_name:
+        display_name = email.split("@")[0] if email else f"Usuario {user_id}"
     return {
         "channel_id": row["channel_id"],
         "user_id": row["user_id"],
         "role": row["role"],
         "muted": bool(row["muted"]),
-        "display_name": info.get("display_name", "") or "",
-        "email": info.get("email", "") or "",
+        "display_name": display_name,
+        "email": email,
     }
