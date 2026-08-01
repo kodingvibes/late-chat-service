@@ -10,6 +10,30 @@ log = logging.getLogger(__name__)
 
 def list_channels(user_id: int, global_role: str = "user") -> list[dict]:
     with db() as conn:
+        # ponytail: materialise this user's membership rows.
+        #
+        # `is_member()` returns True unconditionally -- every user belongs
+        # to every channel -- and when that collapsed, the code that wrote
+        # to channel_members went with it. But 24 read sites still treat
+        # that table as the roster: the online-users panel, the member
+        # count, unread tracking, role and mute lookups, and, most
+        # importantly, broadcast_to_channel_members, which is how messages
+        # and typing indicators actually reach people.
+        #
+        # So anyone who signed up after that change had no rows: they were
+        # invisible in the user list AND received no realtime traffic. On a
+        # freshly seeded database the whole table is empty, which is the
+        # "0 en línea - 0 en el canal / No hay usuarios" panel.
+        #
+        # This is the cheapest place to repair it: listing channels is the
+        # first thing every client does, INSERT OR IGNORE makes it a no-op
+        # once the row exists, and it keeps the table meaning exactly what
+        # the 24 readers already assume it means.
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) "
+            "SELECT id, ?, ? FROM channels",
+            (user_id, int(time.time())),
+        )
         # ponytail: last_seen lives in late-auth now, not here.
         # Global super_admin / admin still get admin on every channel.
         # The role comes from the validated session (not a local
