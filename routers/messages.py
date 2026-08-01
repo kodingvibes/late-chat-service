@@ -43,9 +43,14 @@ async def list_messages_route(channel_id: int, before: Optional[int] = None, lim
     ch = get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "Channel not found")
-    # ponytail: every user belongs to every channel, so there is no
-    # "not a member" failure mode here. The mute check stays in the
-    # write path below.
+    # ponytail: ensure the requesting user is a member of this channel
+    # so they appear in the user list and their presence is tracked.
+    from core.db import db
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) VALUES (?, ?, ?)",
+            (channel_id, session["user_id"], int(time.time())),
+        )
     return list_messages(
         channel_id,
         before,
