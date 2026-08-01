@@ -10,11 +10,6 @@ def list_members(channel_id: int) -> list[dict]:
     here would return zero rows. We pull user ids from the local
     channel_members table and resolve display_name + email through
     the user_cache (which fetches from late-auth on miss).
-
-    Additionally, any user who is currently online (has an active
-    WebSocket connection) but is not yet in channel_members is
-    included, so the sidebar reflects everyone who is actually
-    present in the chat.
     """
     with db() as conn:
         rows = conn.execute(
@@ -22,26 +17,6 @@ def list_members(channel_id: int) -> list[dict]:
             "WHERE channel_id = ? ORDER BY last_read_message_id DESC, user_id",
             (channel_id,),
         ).fetchall()
-    member_ids = {r["user_id"] for r in rows}
-    # Include online users who aren't in channel_members yet
-    online_ids = set(ws_manager.connections.keys())
-    missing_online = online_ids - member_ids
-    if missing_online:
-        # Add them to channel_members so they persist
-        now = int(time.time())
-        with db() as conn:
-            for uid in missing_online:
-                conn.execute(
-                    "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) VALUES (?, ?, ?)",
-                    (channel_id, uid, now),
-                )
-        # Re-fetch to get the full list
-        with db() as conn:
-            rows = conn.execute(
-                "SELECT user_id, role, muted FROM channel_members "
-                "WHERE channel_id = ? ORDER BY last_read_message_id DESC, user_id",
-                (channel_id,),
-            ).fetchall()
     if not rows:
         return []
     by_id = fetch_users([r["user_id"] for r in rows])
