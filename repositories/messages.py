@@ -269,6 +269,15 @@ def send_message(
 ) -> dict:
     user_cache.prime(user_id, display_name=session_display_name, email=session_email)
     with db() as conn:
+        # ponytail: ensure the sender is a member of this channel.
+        # Users who send messages without having explicitly joined
+        # (e.g. new users after the "everyone is in every channel"
+        # change) would otherwise be invisible in the member list
+        # because channel_members has no row for them.
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) VALUES (?, ?, ?)",
+            (channel_id, user_id, int(time.time())),
+        )
         now = int(time.time())
         reply_to_val = reply_to
         if reply_to_val is not None:

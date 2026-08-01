@@ -44,6 +44,21 @@ async def chat_ws(ws: WebSocket, token: str = None):
         await ws.close(code=4401)
         return
     user_id = user["id"]
+    # ponytail: ensure the user has a channel_members row for every
+    # channel. New users (or users who never sent a message) would
+    # otherwise be invisible in the member list because the "every
+    # user is in every channel" invariant only lives in is_member(),
+    # not in the actual data. Without this, the user list shows
+    # fewer people than expected and some users appear without a
+    # display_name.
+    with db() as conn:
+        ch_ids = [r["id"] for r in conn.execute("SELECT id FROM channels").fetchall()]
+        now = int(time.time())
+        for cid in ch_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) VALUES (?, ?, ?)",
+                (cid, user_id, now),
+            )
     became_online = await ws_manager.connect(user_id, ws)
     if became_online:
         await ws_manager.broadcast_online(user_id, True)
