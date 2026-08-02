@@ -10,6 +10,30 @@ log = logging.getLogger(__name__)
 
 def list_channels(user_id: int, global_role: str = "user") -> list[dict]:
     with db() as conn:
+        # ponytail: materialise this user's membership rows.
+        #
+        # `is_member()` is unconditionally True -- everyone belongs to every
+        # channel -- and when membership collapsed to that, the writes to
+        # channel_members went with it. Nothing INSERTs into it any more,
+        # but 24 sites still read it as the roster, including
+        # broadcast_to_channel_members, which is how messages and typing
+        # reach people. So post-split users had no rows: invisible in the
+        # user list and getting no realtime traffic.
+        #
+        # Guarded by a count so this stays a read on the hot path: the
+        # route behind it is refreshed on presence and message events, and
+        # an unconditional INSERT would take a write lock every time.
+        missing = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM channels) - "
+            "(SELECT COUNT(*) FROM channel_members WHERE user_id = ?) AS n",
+            (user_id,),
+        ).fetchone()["n"]
+        if missing:
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at) "
+                "SELECT id, ?, ? FROM channels",
+                (user_id, int(time.time())),
+            )
         # ponytail: last_seen lives in late-auth now, not here.
         # Global super_admin / admin still get admin on every channel.
         # The role comes from the validated session (not a local

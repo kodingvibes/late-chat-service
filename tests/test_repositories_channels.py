@@ -225,3 +225,50 @@ def test_delete_channel_missing_returns_zero(consume_admin_slot, make_session):
     # but the repository helper itself just reports "nothing
     # changed" so callers that bypass the router don't crash.
     assert delete_channel(99999) == 0
+
+
+class TestMembershipMaterialisation:
+    """`is_member()` is unconditionally True -- everyone belongs to every
+    channel -- but nothing wrote to channel_members, while 24 sites read
+    it as the roster: the online-users panel, member counts, unread
+    tracking, roles, and broadcast_to_channel_members, which is how
+    messages and typing reach people. New users had no rows at all.
+    """
+
+    def test_listing_channels_materialises_membership(self, make_session):
+        from core.db import db
+        from repositories.channels import list_channels
+        from repositories.members import list_members
+
+        _, user = make_session("sub-fresh", "fresh@example.com", "Fresh")
+        with db() as conn:
+            conn.execute("DELETE FROM channel_members WHERE user_id = ?", (user["id"],))
+            before = conn.execute(
+                "SELECT COUNT(*) c FROM channel_members WHERE user_id = ?", (user["id"],)
+            ).fetchone()["c"]
+        assert before == 0
+
+        channels = list_channels(user["id"])
+        assert channels, "seeded channels expected"
+
+        with db() as conn:
+            after = conn.execute(
+                "SELECT COUNT(*) c FROM channel_members WHERE user_id = ?", (user["id"],)
+            ).fetchone()["c"]
+        assert after == len(channels), "one membership row per channel"
+
+        # The panel that was showing "No hay usuarios" now sees them.
+        assert user["id"] in [m["id"] for m in list_members(channels[0]["id"])]
+
+    def test_is_idempotent(self, make_session):
+        from core.db import db
+        from repositories.channels import list_channels
+        _, user = make_session("sub-twice", "twice@example.com", "Twice")
+        list_channels(user["id"])
+        list_channels(user["id"])
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) c FROM channel_members WHERE user_id = ?", (user["id"],)
+            ).fetchone()["c"]
+            chans = conn.execute("SELECT COUNT(*) c FROM channels").fetchone()["c"]
+        assert rows == chans
